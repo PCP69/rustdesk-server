@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,7 +51,8 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    // secure_tcp: optional per-connection encryption, set after the key exchange
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -823,7 +824,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = match enc.as_mut() {
+                            Some(enc) => enc.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1178,8 +1183,40 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            // secure_tcp: offer a key exchange, as current clients expect. Clients that do not
+            // take part skip the message and continue in plain text.
+            let mut kx_sk = self.key_exchange_phase1(&mut sink).await;
+            // Reading side of the encryption, kept separate from the sink, which
+            // handle_tcp may move away (punch hole) while this connection is still read.
+            let mut rx_enc: Option<Encrypt> = None;
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(enc) = rx_enc.as_mut() {
+                    if let Err(err) = enc.dec(&mut bytes) {
+                        log::warn!("secure_tcp: decryption failed from {}: {}", addr, err);
+                        break;
+                    }
+                } else if let Some(our_sk) = kx_sk.as_ref() {
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                        if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                            match Self::key_exchange_phase2(&ex, our_sk) {
+                                Ok(enc) => {
+                                    if let Some(Sink::TcpStream(_, tx_enc)) = sink.as_mut() {
+                                        *tx_enc = Some(enc.clone());
+                                    }
+                                    rx_enc = Some(enc);
+                                    kx_sk = None;
+                                    log::debug!("secure_tcp: connection from {} secured", addr);
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::warn!("secure_tcp: key exchange with {} failed: {}", addr, err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1190,6 +1227,31 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// secure_tcp phase 1: send a fresh per-connection box public key, signed with the
+    /// server key, so the client can verify it against the key it was configured with.
+    /// Returns the matching secret key, or None if the server has no signing key.
+    async fn key_exchange_phase1(&self, sink: &mut Option<Sink>) -> Option<box_::SecretKey> {
+        let sk = self.inner.sk.as_ref()?;
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
+        Some(our_sk_b)
+    }
+
+    /// secure_tcp phase 2: the client answers with its box public key and the symmetric key
+    /// sealed for us. Malformed input is an error, never a panic (release builds abort).
+    fn key_exchange_phase2(ex: &KeyExchange, our_sk: &box_::SecretKey) -> ResultType<Encrypt> {
+        if ex.keys.len() != 2 {
+            bail!("invalid key exchange message");
+        }
+        let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], our_sk)?;
+        Ok(Encrypt::new(key))
     }
 
     #[inline]
